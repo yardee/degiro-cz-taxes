@@ -153,16 +153,18 @@ class DividendEvent:
     """One dividend payment (gross + tax paired by ISIN + value_date)."""
     product: str
     isin: str
-    country: str  # from ISIN prefix (US, CZ, FR, IE, ...)
+    country: str  # source country for SZDZ
     value_date: date
     gross: Decimal
     tax_withheld: Decimal  # negative = tax paid, positive = storno
     ccy: str
+    has_treaty: bool = True  # SZDZ exists with this country
     # computed:
     gross_czk: Decimal = Decimal("0")
     tax_czk: Decimal = Decimal("0")
     cz_tax_czk: Decimal = Decimal("0")  # Czech 15% on gross
-    credit_czk: Decimal = Decimal("0")  # recognized credit
+    credit_czk: Decimal = Decimal("0")  # recognized credit (0 if no treaty)
+    expense_czk: Decimal = Decimal("0")  # deductible expense (for non-treaty)
 
 
 # Source country for SZDZ (double-taxation treaty) purposes.
@@ -183,6 +185,19 @@ COUNTRY_NAMES = {
     "DE": "Nemecko", "GB": "Britanie", "LU": "Lucembursko",
     "NO": "Norsko", "JP": "Japonsko", "KY": "Kajmanske ostrovy",
     "TW": "Tchaj-wan",
+}
+
+# Countries with active SZDZ (double-taxation treaty) with Czech Republic.
+# For countries WITH treaty: credit method (zapocet) per §38f odst. 1 ZDP.
+# For countries WITHOUT treaty: no credit, but foreign tax can be deducted
+# as expense per §24 odst. 2 pism. ch) ZDP.
+COUNTRIES_WITH_SZDZ = {
+    "US", "FR", "NL", "IE", "CN", "HK", "CA", "DE", "GB", "LU",
+    "NO", "JP", "AT", "BE", "CH", "DK", "ES", "FI", "GR", "HR",
+    "HU", "IN", "IT", "KR", "MX", "PL", "PT", "RO", "RU", "SE",
+    "SG", "SK", "SI", "TR", "ZA", "IL", "AU", "NZ", "BG", "CY",
+    "EE", "LT", "LV", "MT", "IS",
+    # NOT included: KY (Cayman Islands), TW (Taiwan), PA, etc.
 }
 
 
@@ -944,6 +959,7 @@ def process_dividends(rows, year):
             product=data["product"], isin=isin, country=country,
             value_date=vdate, gross=gross, tax_withheld=tax,
             ccy=data["ccy"],
+            has_treaty=country in COUNTRIES_WITH_SZDZ,
         ))
     return events
 
@@ -955,12 +971,23 @@ def calc_dividend_tax(divs, rates):
         r = rates.get(d.ccy, Decimal("1"))
         d.gross_czk = (d.gross * r).quantize(Decimal("0.01"))
         d.tax_czk = (abs(d.tax_withheld) * r).quantize(Decimal("0.01"))
-        # Czech tax = 15% of gross
-        d.cz_tax_czk = (d.gross_czk * Decimal("0.15")).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP)
-        # Credit = min(foreign tax actually paid, Czech tax on this income)
-        # Cannot credit more than Czech would charge
-        d.credit_czk = min(d.tax_czk, d.cz_tax_czk)
+
+        if d.has_treaty:
+            # Treaty country: credit method (zapocet) per §38f odst. 1 ZDP
+            # Credit = min(foreign tax paid, CZ 15% on gross)
+            d.cz_tax_czk = (d.gross_czk * Decimal("0.15")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP)
+            d.credit_czk = min(d.tax_czk, d.cz_tax_czk)
+            d.expense_czk = Decimal("0")
+        else:
+            # No treaty: no credit, but foreign tax deductible as expense
+            # per §24 odst. 2 pism. ch) ZDP
+            # Taxable base = gross - deductible foreign tax
+            d.expense_czk = d.tax_czk
+            taxable_base = d.gross_czk - d.expense_czk
+            d.cz_tax_czk = (taxable_base * Decimal("0.15")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP)
+            d.credit_czk = Decimal("0")
     return divs
 
 
@@ -985,26 +1012,41 @@ def print_dividend_results(divs, rates, year):
         print("\n--- Zahranicni dividendy ---")
         for i, d in enumerate(foreign_divs, 1):
             cname = COUNTRY_NAMES.get(d.country, d.country)
-            print("\n  {}. {} ({}) [{}]".format(i, d.product, d.isin, cname))
+            treaty_label = "SZDZ" if d.has_treaty else "BEZ SZDZ"
+            print("\n  {}. {} ({}) [{}, {}]".format(
+                i, d.product, d.isin, cname, treaty_label))
             print("     Datum:       {}".format(d.value_date.strftime("%d.%m.%Y")))
             print("     Hruba div.:  {:>10} {} = {:>10} CZK".format(
                 d.gross.quantize(Q), d.ccy, d.gross_czk))
             print("     Srazka:      {:>10} {} = {:>10} CZK".format(
                 abs(d.tax_withheld).quantize(Q), d.ccy, d.tax_czk))
-            print("     CZ dan 15%:                  {:>10} CZK".format(d.cz_tax_czk))
-            print("     Zapocet:                     {:>10} CZK".format(d.credit_czk))
-            doplatek = d.cz_tax_czk - d.credit_czk
-            print("     Doplatek:                    {:>10} CZK".format(
-                doplatek.quantize(Q)))
+            if d.has_treaty:
+                print("     CZ dan 15%:                  {:>10} CZK".format(
+                    d.cz_tax_czk))
+                print("     Zapocet:                     {:>10} CZK".format(
+                    d.credit_czk))
+                doplatek = d.cz_tax_czk - d.credit_czk
+                print("     Doplatek:                    {:>10} CZK".format(
+                    doplatek.quantize(Q)))
+            else:
+                print("     Odpocet dane jako vydaj:     {:>10} CZK".format(
+                    d.expense_czk))
+                print("     Zaklad (hruba - vydaj):      {:>10} CZK".format(
+                    (d.gross_czk - d.expense_czk).quantize(Q)))
+                print("     CZ dan 15%:                  {:>10} CZK".format(
+                    d.cz_tax_czk))
 
     # -- Summary by country --
-    if foreign_divs:
-        print("\n--- Souhrn dle zemi (pro Prilohu c. 3) ---")
+    treaty_divs = [d for d in foreign_divs if d.has_treaty]
+    no_treaty_divs = [d for d in foreign_divs if not d.has_treaty]
+
+    if treaty_divs:
+        print("\n--- Zeme se SZDZ - zapocet dane (Priloha c. 3) ---")
         by_country = defaultdict(lambda: {
             "gross": Decimal("0"), "tax": Decimal("0"),
             "cz_tax": Decimal("0"), "credit": Decimal("0")
         })
-        for d in foreign_divs:
+        for d in treaty_divs:
             c = d.country
             by_country[c]["gross"] += d.gross_czk
             by_country[c]["tax"] += d.tax_czk
@@ -1039,6 +1081,29 @@ def print_dividend_results(divs, rates, year):
             total_cz_tax.quantize(Q), total_credit.quantize(Q),
             total_doplatek.quantize(Q)))
 
+    if no_treaty_divs:
+        print("\n--- Zeme BEZ SZDZ - dan jako vydaj (p24/2/ch ZDP) ---")
+        by_country = defaultdict(lambda: {
+            "gross": Decimal("0"), "expense": Decimal("0"),
+            "cz_tax": Decimal("0")
+        })
+        for d in no_treaty_divs:
+            c = d.country
+            by_country[c]["gross"] += d.gross_czk
+            by_country[c]["expense"] += d.expense_czk
+            by_country[c]["cz_tax"] += d.cz_tax_czk
+
+        print("  {:16s} {:>12s} {:>12s} {:>12s} {:>12s}".format(
+            "Stat", "Prijem CZK", "Vydaj (dan)", "Zaklad", "CZ dan 15%"))
+        for c in sorted(by_country.keys()):
+            s = by_country[c]
+            zaklad = s["gross"] - s["expense"]
+            cname = COUNTRY_NAMES.get(c, c)
+            print("  {:16s} {:>12} {:>12} {:>12} {:>12}".format(
+                cname,
+                s["gross"].quantize(Q), s["expense"].quantize(Q),
+                zaklad.quantize(Q), s["cz_tax"].quantize(Q)))
+
     # -- CZ dividends (srazkova dan) --
     if cz_divs:
         print("\n--- Ceske dividendy (srazkova dan dle p36 ZDP) ---")
@@ -1057,18 +1122,23 @@ def print_dividend_results(divs, rates, year):
 
     if foreign_divs:
         total_gross = sum(d.gross_czk for d in foreign_divs)
+        total_expense = sum(d.expense_czk for d in foreign_divs)
         total_credit = sum(d.credit_czk for d in foreign_divs)
         total_cz_tax = sum(d.cz_tax_czk for d in foreign_divs)
         total_doplatek = total_cz_tax - total_credit
         print("  Zahranicni dividendy (p8):")
         print("    Hrube prijmy:               {:>12} CZK".format(
             total_gross.quantize(Q)))
+        if total_expense > 0:
+            print("    Vydaje (dan bez SZDZ):      {:>12} CZK".format(
+                total_expense.quantize(Q)))
         print("    Dan zaplacena v zahranici:   {:>12} CZK".format(
             sum(d.tax_czk for d in foreign_divs).quantize(Q)))
         print("    CZ dan 15%:                 {:>12} CZK".format(
             total_cz_tax.quantize(Q)))
-        print("    Zapocet zahranicni dane:    {:>12} CZK".format(
-            total_credit.quantize(Q)))
+        if total_credit > 0:
+            print("    Zapocet (zeme se SZDZ):     {:>12} CZK".format(
+                total_credit.quantize(Q)))
         print("    Doplatek dane v CR:         {:>12} CZK".format(
             total_doplatek.quantize(Q)))
     if cz_divs:
