@@ -165,14 +165,34 @@ class DividendEvent:
     credit_czk: Decimal = Decimal("0")  # recognized credit
 
 
-# Map ISIN country prefix -> source country for SZDZ purposes
-# ADRs (US ISIN) are taxed at source by the US, so US prefix = US source
+# Source country for SZDZ (double-taxation treaty) purposes.
+# For ADRs/GDRs the ISIN is US but the dividend source is the actual company country.
+# Override by ISIN where ISIN prefix is misleading.
+ISIN_COUNTRY_OVERRIDE = {
+    # ADRs on non-US companies (US ISIN but foreign source)
+    "US01609W1027": "KY",   # Alibaba (Cayman Islands)
+    "US8356993076": "JP",   # Sony Group Corp
+    "US8740391003": "TW",   # Taiwan Semiconductor (TSMC)
+    # NL-incorporated but Degiro classifies differently
+    "NL0009434992": "GB",   # LyondellBasell Industries
+}
+
 COUNTRY_NAMES = {
     "US": "USA", "CZ": "Cesko", "FR": "Francie", "NL": "Nizozemsko",
     "IE": "Irsko", "CN": "Cina", "HK": "Hongkong", "CA": "Kanada",
     "DE": "Nemecko", "GB": "Britanie", "LU": "Lucembursko",
-    "NO": "Norsko", "JP": "Japonsko",
+    "NO": "Norsko", "JP": "Japonsko", "KY": "Kajmanske ostrovy",
+    "TW": "Tchaj-wan",
 }
+
+
+def resolve_country(isin, product):
+    # type: (str, str) -> str
+    """Determine the source country for dividend taxation.
+    Uses ISIN overrides first, then falls back to ISIN prefix."""
+    if isin in ISIN_COUNTRY_OVERRIDE:
+        return ISIN_COUNTRY_OVERRIDE[isin]
+    return isin[:2] if len(isin) >= 2 else "??"
 
 
 # ---------------------------------------------------------------------------
@@ -919,7 +939,7 @@ def process_dividends(rows, year):
         # Skip negative gross (storno without correction)
         if gross < 0:
             continue
-        country = isin[:2] if len(isin) >= 2 else "??"
+        country = resolve_country(isin, data["product"])
         events.append(DividendEvent(
             product=data["product"], isin=isin, country=country,
             value_date=vdate, gross=gross, tax_withheld=tax,
