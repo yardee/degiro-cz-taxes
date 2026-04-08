@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Výpočet daně z kapitálových zisků z Degiro Account Statement CSV.
+Výpočet daně z kapitálových zisků a dividend z Degiro Account Statement CSV.
 
 Použití:
     python dane_degiro.py "Degiro výpis.csv" 2025
 
 Podporuje:
-    - FIFO párování nákupů a prodejů
+    - FIFO párování nákupů a prodejů (§10 ZDP)
+    - Dividendy a zápočet zahraniční daně (§8 ZDP)
     - Jednotný kurz ČNB (automatický výpočet z denních kurzů)
     - Časový test 3 roky (osvobození od daně)
     - Stock splity, mergery, delistingy, spin-offy, rights issues
@@ -145,6 +146,33 @@ class Disposition:
     gain_czk: Decimal = Decimal("0")
     exempt: bool = False
     partial_exempt_qty: Decimal = Decimal("0")
+
+
+@dataclass
+class DividendEvent:
+    """One dividend payment (gross + tax paired by ISIN + value_date)."""
+    product: str
+    isin: str
+    country: str  # from ISIN prefix (US, CZ, FR, IE, ...)
+    value_date: date
+    gross: Decimal
+    tax_withheld: Decimal  # negative = tax paid, positive = storno
+    ccy: str
+    # computed:
+    gross_czk: Decimal = Decimal("0")
+    tax_czk: Decimal = Decimal("0")
+    cz_tax_czk: Decimal = Decimal("0")  # Czech 15% on gross
+    credit_czk: Decimal = Decimal("0")  # recognized credit
+
+
+# Map ISIN country prefix -> source country for SZDZ purposes
+# ADRs (US ISIN) are taxed at source by the US, so US prefix = US source
+COUNTRY_NAMES = {
+    "US": "USA", "CZ": "Cesko", "FR": "Francie", "NL": "Nizozemsko",
+    "IE": "Irsko", "CN": "Cina", "HK": "Hongkong", "CA": "Kanada",
+    "DE": "Nemecko", "GB": "Britanie", "LU": "Lucembursko",
+    "NO": "Norsko", "JP": "Japonsko",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +884,185 @@ def calc_tax(disps, year, rates):
 
 
 # ---------------------------------------------------------------------------
+# Dividend processing
+# ---------------------------------------------------------------------------
+
+def process_dividends(rows, year):
+    # type: (List[RawRow], int) -> List[DividendEvent]
+    """Extract and pair dividend events for a given year."""
+    # Collect raw dividend and tax rows, keyed by (isin, value_date)
+    raw = defaultdict(lambda: {"div": [], "tax": [], "product": "", "ccy": ""})
+    for r in rows:
+        if r.value_date.year != year:
+            continue
+        d = r.description
+        if d == "Dividenda":
+            key = (r.isin, r.value_date)
+            raw[key]["div"].append(r.mov_amt)
+            raw[key]["product"] = r.product
+            raw[key]["ccy"] = r.mov_ccy
+        elif d == "Daň z dividendy":
+            key = (r.isin, r.value_date)
+            raw[key]["tax"].append(r.mov_amt)
+            if not raw[key]["product"]:
+                raw[key]["product"] = r.product
+            if not raw[key]["ccy"]:
+                raw[key]["ccy"] = r.mov_ccy
+
+    events = []  # type: List[DividendEvent]
+    for (isin, vdate), data in sorted(raw.items(), key=lambda x: x[0][1]):
+        gross = sum(data["div"], Decimal("0"))
+        tax = sum(data["tax"], Decimal("0"))
+        # Skip if gross nets to 0 (full storno)
+        if gross == 0 and tax == 0:
+            continue
+        # Skip negative gross (storno without correction)
+        if gross < 0:
+            continue
+        country = isin[:2] if len(isin) >= 2 else "??"
+        events.append(DividendEvent(
+            product=data["product"], isin=isin, country=country,
+            value_date=vdate, gross=gross, tax_withheld=tax,
+            ccy=data["ccy"],
+        ))
+    return events
+
+
+def calc_dividend_tax(divs, rates):
+    # type: (List[DividendEvent], Dict[str, Decimal]) -> List[DividendEvent]
+    """Calculate CZK values and double-taxation credit for dividends."""
+    for d in divs:
+        r = rates.get(d.ccy, Decimal("1"))
+        d.gross_czk = (d.gross * r).quantize(Decimal("0.01"))
+        d.tax_czk = (abs(d.tax_withheld) * r).quantize(Decimal("0.01"))
+        # Czech tax = 15% of gross
+        d.cz_tax_czk = (d.gross_czk * Decimal("0.15")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP)
+        # Credit = min(foreign tax actually paid, Czech tax on this income)
+        # Cannot credit more than Czech would charge
+        d.credit_czk = min(d.tax_czk, d.cz_tax_czk)
+    return divs
+
+
+def print_dividend_results(divs, rates, year):
+    # type: (List[DividendEvent], Dict[str, Decimal], int) -> None
+    """Print dividend tax report."""
+    if not divs:
+        return
+
+    print("\n{}".format("=" * 72))
+    print("  DIVIDENDY (p8 ZDP) - ROK {}".format(year))
+    print("{}".format("=" * 72))
+
+    # Separate CZ (srazkova dan) from foreign
+    cz_divs = [d for d in divs if d.country == "CZ"]
+    foreign_divs = [d for d in divs if d.country != "CZ"]
+
+    Q = Decimal("0.01")
+
+    # -- Foreign dividends detail --
+    if foreign_divs:
+        print("\n--- Zahranicni dividendy ---")
+        for i, d in enumerate(foreign_divs, 1):
+            cname = COUNTRY_NAMES.get(d.country, d.country)
+            print("\n  {}. {} ({}) [{}]".format(i, d.product, d.isin, cname))
+            print("     Datum:       {}".format(d.value_date.strftime("%d.%m.%Y")))
+            print("     Hruba div.:  {:>10} {} = {:>10} CZK".format(
+                d.gross.quantize(Q), d.ccy, d.gross_czk))
+            print("     Srazka:      {:>10} {} = {:>10} CZK".format(
+                abs(d.tax_withheld).quantize(Q), d.ccy, d.tax_czk))
+            print("     CZ dan 15%:                  {:>10} CZK".format(d.cz_tax_czk))
+            print("     Zapocet:                     {:>10} CZK".format(d.credit_czk))
+            doplatek = d.cz_tax_czk - d.credit_czk
+            print("     Doplatek:                    {:>10} CZK".format(
+                doplatek.quantize(Q)))
+
+    # -- Summary by country --
+    if foreign_divs:
+        print("\n--- Souhrn dle zemi (pro Prilohu c. 3) ---")
+        by_country = defaultdict(lambda: {
+            "gross": Decimal("0"), "tax": Decimal("0"),
+            "cz_tax": Decimal("0"), "credit": Decimal("0")
+        })
+        for d in foreign_divs:
+            c = d.country
+            by_country[c]["gross"] += d.gross_czk
+            by_country[c]["tax"] += d.tax_czk
+            by_country[c]["cz_tax"] += d.cz_tax_czk
+            by_country[c]["credit"] += d.credit_czk
+
+        print("  {:12s} {:>12s} {:>12s} {:>12s} {:>12s} {:>12s}".format(
+            "Stat", "Prijem CZK", "Dan zahr.", "CZ dan 15%",
+            "Zapocet", "Doplatek"))
+        total_gross = Decimal("0")
+        total_tax_foreign = Decimal("0")
+        total_cz_tax = Decimal("0")
+        total_credit = Decimal("0")
+        for c in sorted(by_country.keys()):
+            s = by_country[c]
+            doplatek = s["cz_tax"] - s["credit"]
+            cname = COUNTRY_NAMES.get(c, c)
+            print("  {:12s} {:>12} {:>12} {:>12} {:>12} {:>12}".format(
+                cname,
+                s["gross"].quantize(Q), s["tax"].quantize(Q),
+                s["cz_tax"].quantize(Q), s["credit"].quantize(Q),
+                doplatek.quantize(Q)))
+            total_gross += s["gross"]
+            total_tax_foreign += s["tax"]
+            total_cz_tax += s["cz_tax"]
+            total_credit += s["credit"]
+
+        total_doplatek = total_cz_tax - total_credit
+        print("  {:12s} {:>12} {:>12} {:>12} {:>12} {:>12}".format(
+            "CELKEM",
+            total_gross.quantize(Q), total_tax_foreign.quantize(Q),
+            total_cz_tax.quantize(Q), total_credit.quantize(Q),
+            total_doplatek.quantize(Q)))
+
+    # -- CZ dividends (srazkova dan) --
+    if cz_divs:
+        print("\n--- Ceske dividendy (srazkova dan dle p36 ZDP) ---")
+        print("  (Neuvadeji se do danoveho priznani - dan je konecna)")
+        for d in cz_divs:
+            print("  {} | {:>10} {} | srazka {:>10} {} | cista {:>10} {}".format(
+                d.product,
+                d.gross.quantize(Q), d.ccy,
+                abs(d.tax_withheld).quantize(Q), d.ccy,
+                (d.gross + d.tax_withheld).quantize(Q), d.ccy))
+
+    # -- Grand summary --
+    print("\n{}".format("=" * 72))
+    print("  SOUHRN DIVIDEND - ROK {}".format(year))
+    print("{}".format("=" * 72))
+
+    if foreign_divs:
+        total_gross = sum(d.gross_czk for d in foreign_divs)
+        total_credit = sum(d.credit_czk for d in foreign_divs)
+        total_cz_tax = sum(d.cz_tax_czk for d in foreign_divs)
+        total_doplatek = total_cz_tax - total_credit
+        print("  Zahranicni dividendy (p8):")
+        print("    Hrube prijmy:               {:>12} CZK".format(
+            total_gross.quantize(Q)))
+        print("    Dan zaplacena v zahranici:   {:>12} CZK".format(
+            sum(d.tax_czk for d in foreign_divs).quantize(Q)))
+        print("    CZ dan 15%:                 {:>12} CZK".format(
+            total_cz_tax.quantize(Q)))
+        print("    Zapocet zahranicni dane:    {:>12} CZK".format(
+            total_credit.quantize(Q)))
+        print("    Doplatek dane v CR:         {:>12} CZK".format(
+            total_doplatek.quantize(Q)))
+    if cz_divs:
+        cz_total = sum(d.gross for d in cz_divs)
+        cz_tax_total = sum(abs(d.tax_withheld) for d in cz_divs)
+        print("  Ceske dividendy (srazkova dan):")
+        print("    Hrube prijmy:               {:>12} CZK".format(
+            cz_total.quantize(Q)))
+        print("    Srazena dan:                {:>12} CZK".format(
+            cz_tax_total.quantize(Q)))
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -1005,6 +1212,13 @@ def main():
     year_disps = calc_tax(disps, args.tax_year, rates)
 
     print_results(year_disps, rates, args.tax_year)
+
+    # Dividends
+    print("Zpracovavam dividendy...")
+    div_events = process_dividends(rows, args.tax_year)
+    print("  Dividend: {}".format(len(div_events)))
+    div_events = calc_dividend_tax(div_events, rates)
+    print_dividend_results(div_events, rates, args.tax_year)
 
     if pf.warnings:
         print("VAROVANI:")

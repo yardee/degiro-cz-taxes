@@ -1,10 +1,10 @@
 # Dane - Degiro Tax Calculator
 
-Czech capital gains tax calculator for Degiro broker account statements.
+Czech capital gains and dividend tax calculator for Degiro broker account statements.
 
 ## Project overview
 
-Single-file Python tool (`dane_degiro.py`) that calculates capital gains tax for Czech tax returns from Degiro Account Statement CSV exports. No external dependencies - stdlib only (Python 3.9+).
+Single-file Python tool (`dane_degiro.py`) that calculates capital gains tax (§10 ZDP) and dividend tax with double-taxation credit (§8 ZDP) for Czech tax returns from Degiro Account Statement CSV exports. No external dependencies - stdlib only (Python 3.9+).
 
 ### Usage
 
@@ -50,6 +50,7 @@ Classified from the `Popis` (description) column:
 
 ## Processing pipeline
 
+### Capital gains (§10)
 1. Parse CSV, normalize non-breaking spaces in descriptions
 2. Pre-build: fees per order, corporate action cash, paired events (splits/mergers/changes)
 3. Process chronologically (oldest first): build FIFO lots, handle corporate actions
@@ -57,14 +58,29 @@ Classified from the `Popis` (description) column:
 5. Calculate CZK values using unified rate, apply time test per portion
 6. Output detail + summary
 
+### Dividends (§8)
+1. Collect all "Dividenda" and "Daň z dividendy" rows for the tax year
+2. Pair by (ISIN, value_date), net stornos (negative entries)
+3. Separate CZ dividends (srážková daň - final, not reported) from foreign
+4. Convert to CZK using unified rate
+5. Calculate double-taxation credit (metoda prostého zápočtu):
+   - CZ tax = 15% of gross dividend in CZK
+   - Credit = min(foreign tax paid, CZ tax on that income)
+   - Doplatek = CZ tax - credit
+6. Output per-dividend detail, summary by country (for Příloha č. 3), grand total
+
 ## Output for tax return
 
-Goes into **Prilozha c. 2, oddil 2** (§10 ZDP):
+### Capital gains -> Příloha č. 2, oddíl 2 (§10 ZDP):
 - `Zdanitelne prijmy`: taxable sell proceeds in CZK
 - `Vydaje`: acquisition costs + fees in CZK
 - `Dilci zaklad dane`: taxable gain (difference)
+- Exempt sales (time test) are excluded from both income and expenses
 
-Exempt sales (time test) are excluded from both income and expenses.
+### Dividends -> §8 ZDP + Příloha č. 3 (zápočet):
+- Foreign dividends: gross income (§8), per-country credit calculation (Příloha č. 3)
+- CZ dividends: srážková daň is final (§36), not included in tax return
+- Double-taxation credit limited to CZ 15% rate per dividend
 
 ## Known edge cases handled
 
