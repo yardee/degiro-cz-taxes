@@ -100,6 +100,10 @@ python3 -m unittest test_dane_degiro -v
 - Pro ADR je nutné ručně doplnit mapování země v `ISIN_COUNTRY_OVERRIDE` pokud přibude nové ADR
 - Program nepočítá celkovou daňovou povinnost - pro Přílohu č. 3 je potřeba znát celkový základ daně ze všech příjmů
 
+## Disclaimer
+
+Tento program slouží pouze jako **pomocný nástroj** pro výpočet podkladů k daňovému přiznání. Autor neručí za správnost výpočtů ani za soulad s aktuální legislativou. Výstupy programu **nenahrazují odborné daňové poradenství**. Před podáním daňového přiznání doporučujeme výsledky ověřit s daňovým poradcem. Za správnost údajů v daňovém přiznání odpovídá vždy poplatník.
+
 ## Licence
 
 MIT
