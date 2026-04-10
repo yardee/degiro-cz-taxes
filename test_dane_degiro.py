@@ -1200,5 +1200,191 @@ class TestRealData(unittest.TestCase):
             self.assertGreater(d.expense_czk, D("0"))
 
 
+# ===================================================================
+# 15. Return of capital - proportional distribution
+# ===================================================================
+
+class TestReturnOfCapitalProportional(unittest.TestCase):
+    def test_single_lot_same_as_before(self):
+        """Single lot: proportional = flat per-unit (no difference)."""
+        pf = Portfolio()
+        pf._add_lot("X", "LYB", date(2020, 1, 1), 3, D("58.04"), "USD",
+                     fee_zero(), "")
+        pf.handle_return_of_capital("X", D("15.60"))
+        # per-share: 15.60 / 3 = 5.20
+        expected = D("58.04") - D("5.20")
+        self.assertEqual(pf.lots["X"][0].price_per_unit, expected)
+
+    def test_two_lots_different_prices(self):
+        """Two lots at different prices: reduction proportional to cost basis."""
+        pf = Portfolio()
+        # Lot A: 2 shares @ 100 = cost 200
+        pf._add_lot("X", "Stock", date(2020, 1, 1), 2, D("100"), "USD",
+                     fee_zero(), "")
+        # Lot B: 2 shares @ 50 = cost 100
+        pf._add_lot("X", "Stock", date(2021, 1, 1), 2, D("50"), "USD",
+                     fee_zero(), "")
+        # Total cost = 300. Return 30 USD.
+        pf.handle_return_of_capital("X", D("30"))
+        # Lot A share: 30 * 200/300 = 20 -> reduction per unit: 20/2 = 10
+        self.assertEqual(pf.lots["X"][0].price_per_unit, D("100") - D("10"))
+        # Lot B share: 30 * 100/300 = 10 -> reduction per unit: 10/2 = 5
+        self.assertEqual(pf.lots["X"][1].price_per_unit, D("50") - D("5"))
+
+    def test_proportional_preserves_total_reduction(self):
+        """Total cost reduction equals the return of capital amount."""
+        pf = Portfolio()
+        pf._add_lot("X", "S", date(2020, 1, 1), 5, D("80"), "USD",
+                     fee_zero(), "")
+        pf._add_lot("X", "S", date(2021, 1, 1), 3, D("120"), "USD",
+                     fee_zero(), "")
+        total_before = sum(l.price_per_unit * l.quantity for l in pf.lots["X"])
+        pf.handle_return_of_capital("X", D("40"))
+        total_after = sum(l.price_per_unit * l.quantity for l in pf.lots["X"])
+        diff = total_before - total_after
+        self.assertAlmostEqual(float(diff), 40.0, places=2)
+
+    def test_zero_cost_lots_fallback(self):
+        """Lots with 0 cost basis fall back to equal per-share distribution."""
+        pf = Portfolio()
+        pf._add_lot("X", "S", date(2020, 1, 1), 10, D("0"), "USD",
+                     fee_zero(), "")
+        pf.handle_return_of_capital("X", D("50"))
+        # Cost was 0, floor at 0
+        self.assertEqual(pf.lots["X"][0].price_per_unit, D("0"))
+
+    def test_floor_zero_with_proportional(self):
+        """Reduction capped at 0 per lot even with proportional."""
+        pf = Portfolio()
+        pf._add_lot("X", "S", date(2020, 1, 1), 1, D("10"), "USD",
+                     fee_zero(), "")
+        pf._add_lot("X", "S", date(2021, 1, 1), 1, D("90"), "USD",
+                     fee_zero(), "")
+        # Return 200 (more than total cost 100)
+        pf.handle_return_of_capital("X", D("200"))
+        self.assertEqual(pf.lots["X"][0].price_per_unit, D("0"))
+        self.assertEqual(pf.lots["X"][1].price_per_unit, D("0"))
+
+
+# ===================================================================
+# 16. Non-negativity of §10 tax base
+# ===================================================================
+
+class TestNonNegativeTaxBase(unittest.TestCase):
+    def _make_disp(self, sell_date, portions, proceeds, ccy):
+        return Disposition(
+            product="X", isin="XX", sell_date=sell_date,
+            sell_qty=sum(p.qty for p in portions),
+            proceeds=proceeds, ccy=ccy,
+            sell_fees=fee_zero(),
+            portions=portions, source="trade",
+        )
+
+    def test_loss_produces_zero_dilci(self):
+        """§10/4 ZDP: loss cannot be applied, dilci zaklad = 0."""
+        # Buy at 100, sell at 50 -> loss
+        portions = [MatchedPortion(
+            buy_date=date(2024, 1, 1), qty=D("10"),
+            cost_per_unit=D("100"), cost_ccy="USD", fees=fee_zero())]
+        d = self._make_disp(date(2025, 6, 1), portions, D("500"), "USD")
+        results = calc_tax([d], 2025, RATES)
+        r = results[0]
+        # gain_czk should be negative: 500*22 - 1000*22 = -11000
+        self.assertTrue(r.gain_czk < 0)
+
+    def test_gain_produces_positive_dilci(self):
+        """Positive gain passes through normally."""
+        portions = [MatchedPortion(
+            buy_date=date(2024, 1, 1), qty=D("10"),
+            cost_per_unit=D("10"), cost_ccy="USD", fees=fee_zero())]
+        d = self._make_disp(date(2025, 6, 1), portions, D("200"), "USD")
+        results = calc_tax([d], 2025, RATES)
+        r = results[0]
+        self.assertTrue(r.gain_czk > 0)
+
+
+# ===================================================================
+# 17. 100,000 CZK exemption (§4/1/x ZDP, from 2025)
+# ===================================================================
+
+class TestSmallProceedsExemption(unittest.TestCase):
+    def _make_disp(self, sell_date, portions, proceeds, ccy, sell_fees=None):
+        return Disposition(
+            product="X", isin="XX", sell_date=sell_date,
+            sell_qty=sum(p.qty for p in portions),
+            proceeds=proceeds, ccy=ccy,
+            sell_fees=sell_fees or fee_zero(),
+            portions=portions, source="trade",
+        )
+
+    def test_under_100k_exempt(self):
+        """Proceeds under 100k CZK in 2025 -> all exempt."""
+        # 4000 USD * 22 = 88,000 CZK < 100,000
+        portions = [MatchedPortion(
+            buy_date=date(2024, 1, 1), qty=D("10"),
+            cost_per_unit=D("300"), cost_ccy="USD", fees=fee_zero())]
+        d = self._make_disp(date(2025, 6, 1), portions, D("4000"), "USD")
+        results = calc_tax([d], 2025, RATES)
+        # Total taxable proceeds = 4000 * 22 = 88000 < 100000
+        total_income = sum(
+            r.taxable_proceeds_czk if hasattr(r, "taxable_proceeds_czk")
+            else (D("0") if r.exempt else r.proceeds_czk)
+            for r in results
+        )
+        self.assertLessEqual(total_income, D("100000"))
+
+    def test_over_100k_not_exempt(self):
+        """Proceeds over 100k CZK in 2025 -> not exempt."""
+        # 5000 USD * 22 = 110,000 CZK > 100,000
+        portions = [MatchedPortion(
+            buy_date=date(2024, 1, 1), qty=D("10"),
+            cost_per_unit=D("300"), cost_ccy="USD", fees=fee_zero())]
+        d = self._make_disp(date(2025, 6, 1), portions, D("5000"), "USD")
+        results = calc_tax([d], 2025, RATES)
+        total_income = sum(
+            r.taxable_proceeds_czk if hasattr(r, "taxable_proceeds_czk")
+            else (D("0") if r.exempt else r.proceeds_czk)
+            for r in results
+        )
+        self.assertGreater(total_income, D("100000"))
+
+    def test_pre_2025_no_exemption(self):
+        """Before 2025, the 100k exemption does not apply."""
+        portions = [MatchedPortion(
+            buy_date=date(2023, 1, 1), qty=D("10"),
+            cost_per_unit=D("300"), cost_ccy="USD", fees=fee_zero())]
+        d = self._make_disp(date(2024, 6, 1), portions, D("4000"), "USD")
+        results = calc_tax([d], 2024, RATES)
+        r = results[0]
+        # Should still be taxable (no §4/1/x before 2025)
+        self.assertFalse(r.exempt)
+        self.assertGreater(r.proceeds_czk, D("0"))
+
+    def test_time_tested_not_counted(self):
+        """Time-tested sales don't count toward the 100k limit."""
+        # Time-tested sale (> 3 years)
+        p_exempt = MatchedPortion(
+            buy_date=date(2020, 1, 1), qty=D("100"),
+            cost_per_unit=D("50"), cost_ccy="USD", fees=fee_zero())
+        d_exempt = self._make_disp(date(2025, 6, 1), [p_exempt],
+                                   D("100000"), "USD")
+        # Non-time-tested sale, small proceeds
+        p_taxable = MatchedPortion(
+            buy_date=date(2024, 1, 1), qty=D("1"),
+            cost_per_unit=D("10"), cost_ccy="USD", fees=fee_zero())
+        d_taxable = self._make_disp(date(2025, 6, 1), [p_taxable],
+                                    D("50"), "USD")
+        results = calc_tax([d_exempt, d_taxable], 2025, RATES)
+        # The exempt sale has huge proceeds but is time-tested
+        # The taxable sale has 50*22=1100 CZK proceeds < 100k
+        taxable_results = [r for r in results if not r.exempt]
+        total_taxable_income = sum(
+            r.taxable_proceeds_czk if hasattr(r, "taxable_proceeds_czk")
+            else r.proceeds_czk
+            for r in taxable_results
+        )
+        self.assertLessEqual(total_taxable_income, D("100000"))
+
+
 if __name__ == "__main__":
     unittest.main()

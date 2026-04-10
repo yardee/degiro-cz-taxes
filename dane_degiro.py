@@ -573,12 +573,23 @@ class Portfolio:
     def handle_return_of_capital(self, isin, amount):
         # type: (str, Decimal) -> None
         lots = self.lots.get(isin, [])
-        total_qty = sum(l.quantity for l in lots)
-        if total_qty == 0:
+        total_cost = sum(l.price_per_unit * l.quantity for l in lots)
+        if total_cost == 0:
+            # Fall back to equal per-share distribution if cost basis is 0
+            total_qty = sum(l.quantity for l in lots)
+            if total_qty == 0:
+                return
+            for lot in lots:
+                reduction = amount / total_qty
+                lot.price_per_unit = max(Decimal("0"),
+                                         lot.price_per_unit - reduction)
             return
         for lot in lots:
-            reduction = amount / total_qty
-            lot.price_per_unit = max(Decimal("0"), lot.price_per_unit - reduction)
+            lot_cost = lot.price_per_unit * lot.quantity
+            lot_share = amount * lot_cost / total_cost
+            reduction = lot_share / lot.quantity if lot.quantity > 0 else Decimal("0")
+            lot.price_per_unit = max(Decimal("0"),
+                                     lot.price_per_unit - reduction)
 
 
 # ---------------------------------------------------------------------------
@@ -1303,6 +1314,12 @@ def print_results(disps, rates, year):
             total_expense += d.cost_czk + d.fees_czk
             total_taxable_gain += d.gain_czk
 
+    # §4/1/x ZDP (from 2025): if total gross taxable proceeds <= 100,000 CZK,
+    # all non-time-tested sales are exempt.
+    SMALL_PROCEEDS_LIMIT = Decimal("100000")
+    small_proceeds_exempt = (year >= 2025
+                             and total_income <= SMALL_PROCEEDS_LIMIT)
+
     print("\n{}".format("=" * 72))
     print("  KAPITALOVE ZISKY - SOUHRN PRO DANOVE PRIZNAN - ROK {}".format(year))
     print("{}".format("=" * 72))
@@ -1313,16 +1330,32 @@ def print_results(disps, rates, year):
         n_total, n_taxable, n_exempt))
     print("  Osvobozeno (p4/1/w):  {:>14} CZK  (neuvadi se)".format(
         total_exempt_gain.quantize(Q2)))
+
+    if year >= 2025:
+        print("  Prijmy (neosvobozene): {:>13} CZK  (limit 100 000 CZK, p4/1/x)".format(
+            total_income.quantize(Q2)))
+        if small_proceeds_exempt:
+            print("  -> Osvobozeno dle p4/1/x ZDP (prijmy <= 100 000 CZK)")
+        else:
+            print("  -> Limit PREKROCEN, osvobozeni p4/1/x se NEUPLATNI")
+
     print()
-    print("  >>> PRILOHA c. 2, oddil 2, tabulka c. 1 (p10 ZDP) <<<")
-    print("  Druh prijmu: Prijmy z uplatneho prevodu cennych papiru p10/1/b/1")
-    print("  Prijmy:               {:>14} CZK".format(total_income.quantize(Q2)))
-    print("  Vydaje:               {:>14} CZK".format(total_expense.quantize(Q2)))
-    print()
-    dilci = total_taxable_gain.quantize(Q2)
-    print("  >>> HLAVNI FORMULAR <<<")
-    print("  Radek 40 (dilci zaklad dane p10): {:>10} CZK".format(dilci))
-    print()
+    if small_proceeds_exempt:
+        print("  >>> Vsechny prodeje osvobozeny - NEUVADI SE do priznani <<<")
+        print()
+    else:
+        print("  >>> PRILOHA c. 2, oddil 2, tabulka c. 1 (p10 ZDP) <<<")
+        print("  Druh prijmu: Prijmy z uplatneho prevodu cennych papiru p10/1/b/1")
+        print("  Prijmy:               {:>14} CZK".format(total_income.quantize(Q2)))
+        print("  Vydaje:               {:>14} CZK".format(total_expense.quantize(Q2)))
+        print()
+        dilci = max(Decimal("0"), total_taxable_gain).quantize(Q2)
+        print("  >>> HLAVNI FORMULAR <<<")
+        print("  Radek 40 (dilci zaklad dane p10): {:>10} CZK".format(dilci))
+        if total_taxable_gain < 0:
+            print("  (Ztrata {} CZK - dle p10/4 ZDP se k ni neprihlizi)".format(
+                total_taxable_gain.quantize(Q2)))
+        print()
 
 
 # ---------------------------------------------------------------------------
