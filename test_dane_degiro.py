@@ -758,33 +758,59 @@ class TestDividendTax(unittest.TestCase):
         self.assertEqual(d.expense_czk, D("0"))
 
     def test_treaty_rate_caps_credit_fr(self):
-        """FR dividend 25% withholding, 10% treaty: credit capped at 10%."""
+        """FR dividend 25% withholding, 10% treaty: credit capped at treaty 10%."""
         d = self._make_div("FR", "100", "-25", "EUR")
         calc_dividend_tax([d], RATES)
         # gross_czk = 100 * 25 = 2500
         # tax_czk = 25 * 25 = 625
         # CZ tax 15% = 375
-        # Treaty max 10% = 250
+        # Treaty max 10% of 2500 = 250
         # Credit = min(625, 250, 375) = 250
         self.assertEqual(d.credit_czk, D("250"))
-        # Doplatek = 375 - 250 = 125 (excess 375 claimable from FR)
+        # Doplatek = 375 - 250 = 125
         self.assertEqual(d.cz_tax_czk - d.credit_czk, D("125"))
+        # Excess withholding = 625 - 250 = 375 (reclaimable from FR)
 
     def test_treaty_rate_caps_credit_nl(self):
-        """NL dividend 15% withholding, 10% treaty: credit capped at 10%."""
+        """NL dividend 15% withholding, 10% treaty: credit capped at treaty 10%."""
         d = self._make_div("NL", "100", "-15", "EUR")
         calc_dividend_tax([d], RATES)
         # gross_czk = 2500, tax_czk = 375, CZ 15% = 375, treaty 10% = 250
         # Credit = min(375, 250, 375) = 250
         self.assertEqual(d.credit_czk, D("250"))
 
+    def test_treaty_rate_caps_credit_jp(self):
+        """JP dividend 15% withholding, 10% treaty: credit capped at treaty 10%."""
+        d = self._make_div("JP", "100", "-15")
+        calc_dividend_tax([d], RATES)
+        # gross_czk = 2200, tax_czk = 330, CZ 15% = 330, treaty 10% = 220
+        # Credit = min(330, 220, 330) = 220
+        self.assertEqual(d.credit_czk, D("220"))
+
     def test_treaty_actual_below_treaty_rate(self):
         """CN dividend 10% withholding, 10% treaty: credit = actual."""
         d = self._make_div("CN", "100", "-10")
         calc_dividend_tax([d], RATES)
-        # tax_czk = 220, treaty max = 220, CZ 15% = 330
+        # tax_czk = 220, treaty max 10% = 220, CZ 15% = 330
         # Credit = min(220, 220, 330) = 220
         self.assertEqual(d.credit_czk, D("220"))
+
+    def test_treaty_actual_below_all_caps(self):
+        """GB dividend 5% actual withholding, 15% treaty: credit = actual."""
+        d = self._make_div("GB", "100", "-5")
+        calc_dividend_tax([d], RATES)
+        # tax_czk = 110, treaty 15% = 330, CZ 15% = 330
+        # Credit = min(110, 330, 330) = 110
+        self.assertEqual(d.credit_czk, D("110"))
+
+    def test_three_cap_rule_all_different(self):
+        """Scenario where all three caps are different values."""
+        # FI treaty = 5%, actual withholding 30%, CZ = 15%
+        d = self._make_div("FI", "100", "-30")
+        calc_dividend_tax([d], RATES)
+        # gross_czk = 2200, tax_czk = 660, CZ 15% = 330, treaty 5% = 110
+        # Credit = min(660, 110, 330) = 110
+        self.assertEqual(d.credit_czk, D("110"))
 
     def test_no_treaty_expense_deduction(self):
         """TW dividend (no SZDZ): tax as expense, no credit."""
@@ -816,6 +842,12 @@ class TestDividendTax(unittest.TestCase):
         for c in data_countries:
             self.assertIn(c, TREATY_MAX_DIV_RATE,
                           "{} missing from TREATY_MAX_DIV_RATE".format(c))
+
+    def test_treaty_rates_not_exceed_15pct(self):
+        """No treaty rate should exceed the CZ 15% rate."""
+        for country, rate in TREATY_MAX_DIV_RATE.items():
+            self.assertLessEqual(rate, D("0.15"),
+                                 "{} treaty rate {} > 15%".format(country, rate))
 
 
 # ===================================================================
