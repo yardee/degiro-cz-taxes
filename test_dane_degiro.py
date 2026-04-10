@@ -15,7 +15,7 @@ from decimal import Decimal
 from dane_degiro import (
     BuyLot, DividendEvent, Disposition, MatchedPortion, Portfolio,
     RawRow, SellEvent,
-    COUNTRIES_WITH_SZDZ, ISIN_COUNTRY_OVERRIDE,
+    COUNTRIES_WITH_SZDZ, ISIN_COUNTRY_OVERRIDE, TREATY_MAX_DIV_RATE,
     calc_dividend_tax, calc_tax, classify, fee_add, fee_display,
     fee_scale, fee_to_czk, fee_zero, fifo_match, parse_date, parse_dec,
     parse_trade, passes_time_test, process_all, process_dividends,
@@ -746,40 +746,53 @@ class TestDividendTax(unittest.TestCase):
             tax_withheld=D(tax), ccy=ccy, has_treaty=has_treaty,
         )
 
-    def test_treaty_credit(self):
-        """US dividend: credit = min(tax_paid, 15% of gross)."""
+    def test_treaty_credit_us_15pct(self):
+        """US dividend 15% withholding, 15% treaty: full credit."""
         d = self._make_div("US", "100", "-15")
         calc_dividend_tax([d], RATES)
-        # gross_czk = 100 * 22 = 2200
         self.assertEqual(d.gross_czk, D("2200"))
-        # tax_czk = 15 * 22 = 330
         self.assertEqual(d.tax_czk, D("330"))
-        # CZ tax = 15% of 2200 = 330
         self.assertEqual(d.cz_tax_czk, D("330"))
-        # Credit = min(330, 330) = 330
+        # US treaty 15%, CZ 15% -> min(330, 330, 330) = 330
         self.assertEqual(d.credit_czk, D("330"))
-        # No expense deduction for treaty countries
         self.assertEqual(d.expense_czk, D("0"))
 
-    def test_treaty_credit_capped_at_cz_rate(self):
-        """FR dividend with 25% withholding: credit capped at CZ 15%."""
+    def test_treaty_rate_caps_credit_fr(self):
+        """FR dividend 25% withholding, 10% treaty: credit capped at 10%."""
         d = self._make_div("FR", "100", "-25", "EUR")
         calc_dividend_tax([d], RATES)
         # gross_czk = 100 * 25 = 2500
         # tax_czk = 25 * 25 = 625
-        # CZ tax = 15% of 2500 = 375
-        # Credit = min(625, 375) = 375
-        self.assertEqual(d.credit_czk, D("375"))
+        # CZ tax 15% = 375
+        # Treaty max 10% = 250
+        # Credit = min(625, 250, 375) = 250
+        self.assertEqual(d.credit_czk, D("250"))
+        # Doplatek = 375 - 250 = 125 (excess 375 claimable from FR)
+        self.assertEqual(d.cz_tax_czk - d.credit_czk, D("125"))
+
+    def test_treaty_rate_caps_credit_nl(self):
+        """NL dividend 15% withholding, 10% treaty: credit capped at 10%."""
+        d = self._make_div("NL", "100", "-15", "EUR")
+        calc_dividend_tax([d], RATES)
+        # gross_czk = 2500, tax_czk = 375, CZ 15% = 375, treaty 10% = 250
+        # Credit = min(375, 250, 375) = 250
+        self.assertEqual(d.credit_czk, D("250"))
+
+    def test_treaty_actual_below_treaty_rate(self):
+        """CN dividend 10% withholding, 10% treaty: credit = actual."""
+        d = self._make_div("CN", "100", "-10")
+        calc_dividend_tax([d], RATES)
+        # tax_czk = 220, treaty max = 220, CZ 15% = 330
+        # Credit = min(220, 220, 330) = 220
+        self.assertEqual(d.credit_czk, D("220"))
 
     def test_no_treaty_expense_deduction(self):
         """TW dividend (no SZDZ): tax as expense, no credit."""
         d = self._make_div("TW", "100", "-20")
         calc_dividend_tax([d], RATES)
-        # No credit
         self.assertEqual(d.credit_czk, D("0"))
-        # Expense = tax_czk = 20 * 22 = 440
         self.assertEqual(d.expense_czk, D("440"))
-        # CZ tax = 15% of (2200 - 440) = 15% of 1760 = 264
+        # CZ tax = 15% of (2200 - 440) = 264
         self.assertEqual(d.cz_tax_czk, D("264"))
 
     def test_no_treaty_zero_tax(self):
@@ -788,7 +801,6 @@ class TestDividendTax(unittest.TestCase):
         calc_dividend_tax([d], RATES)
         self.assertEqual(d.credit_czk, D("0"))
         self.assertEqual(d.expense_czk, D("0"))
-        # CZ tax = 15% of 2200 = 330
         self.assertEqual(d.cz_tax_czk, D("330"))
 
     def test_treaty_zero_tax_ie(self):
@@ -797,6 +809,13 @@ class TestDividendTax(unittest.TestCase):
         calc_dividend_tax([d], RATES)
         self.assertEqual(d.credit_czk, D("0"))
         self.assertEqual(d.cz_tax_czk, D("330"))
+
+    def test_treaty_rates_defined_for_all_szdz_countries_in_data(self):
+        """Every country in the user's data with SZDZ should have a rate."""
+        data_countries = {"US", "FR", "NL", "IE", "CN", "JP", "GB"}
+        for c in data_countries:
+            self.assertIn(c, TREATY_MAX_DIV_RATE,
+                          "{} missing from TREATY_MAX_DIV_RATE".format(c))
 
 
 # ===================================================================

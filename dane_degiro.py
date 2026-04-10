@@ -200,6 +200,40 @@ COUNTRIES_WITH_SZDZ = {
     # NOT included: KY (Cayman Islands), TW (Taiwan), PA, etc.
 }
 
+# Maximum dividend withholding rate per treaty (SZDZ) for portfolio investors.
+# Used to cap the creditable foreign tax: credit = min(paid, treaty_max, CZ 15%).
+# Source: individual bilateral treaties, Article 10 (Dividends).
+# Rates for NON-substantial holdings (typically < 25% ownership).
+TREATY_MAX_DIV_RATE = {
+    "US": Decimal("0.15"),   # 15% (with W-8BEN)
+    "FR": Decimal("0.10"),   # 10%
+    "NL": Decimal("0.10"),   # 10%
+    "IE": Decimal("0.15"),   # 15%
+    "CN": Decimal("0.10"),   # 10%
+    "HK": Decimal("0.05"),   # 5% (HK practically 0%)
+    "CA": Decimal("0.15"),   # 15%
+    "DE": Decimal("0.15"),   # 15%
+    "GB": Decimal("0.15"),   # 15%
+    "LU": Decimal("0.15"),   # 15%
+    "NO": Decimal("0.15"),   # 15%
+    "JP": Decimal("0.10"),   # 10%
+    "AT": Decimal("0.10"),   # 10%
+    "CH": Decimal("0.15"),   # 15%
+    "SE": Decimal("0.10"),   # 10%
+    "DK": Decimal("0.15"),   # 15%
+    "FI": Decimal("0.05"),   # 5%
+    "ES": Decimal("0.15"),   # 15%
+    "IT": Decimal("0.15"),   # 15%
+    "PL": Decimal("0.05"),   # 5%
+    "SK": Decimal("0.05"),   # 5%
+    "KR": Decimal("0.05"),   # 5%
+    "IN": Decimal("0.10"),   # 10%
+    "AU": Decimal("0.15"),   # 15%
+    "IL": Decimal("0.05"),   # 5%
+    "SG": Decimal("0.05"),   # 5%
+    # Default for unlisted treaty countries: 15% (conservative)
+}
+
 
 def resolve_country(isin, product):
     # type: (str, str) -> str
@@ -966,23 +1000,30 @@ def process_dividends(rows, year):
 
 def calc_dividend_tax(divs, rates):
     # type: (List[DividendEvent], Dict[str, Decimal]) -> List[DividendEvent]
-    """Calculate CZK values and double-taxation credit for dividends."""
+    """Calculate CZK values and double-taxation credit for dividends.
+
+    Three-cap rule for treaty countries (§38f ZDP):
+        credit = min(actual_tax_paid, treaty_max_rate * gross, CZ_15% * gross)
+    Non-treaty countries: no credit, tax deductible as expense (§24/2/ch).
+    """
     for d in divs:
         r = rates.get(d.ccy, Decimal("1"))
         d.gross_czk = (d.gross * r).quantize(Decimal("0.01"))
         d.tax_czk = (abs(d.tax_withheld) * r).quantize(Decimal("0.01"))
 
         if d.has_treaty:
-            # Treaty country: credit method (zapocet) per §38f odst. 1 ZDP
-            # Credit = min(foreign tax paid, CZ 15% on gross)
+            # CZ tax = 15% of gross
             d.cz_tax_czk = (d.gross_czk * Decimal("0.15")).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP)
-            d.credit_czk = min(d.tax_czk, d.cz_tax_czk)
+            # Treaty max: cap creditable tax at the treaty rate
+            treaty_rate = TREATY_MAX_DIV_RATE.get(d.country, Decimal("0.15"))
+            treaty_max_czk = (d.gross_czk * treaty_rate).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP)
+            # Credit = min(actual tax, treaty cap, CZ tax)
+            d.credit_czk = min(d.tax_czk, treaty_max_czk, d.cz_tax_czk)
             d.expense_czk = Decimal("0")
         else:
-            # No treaty: no credit, but foreign tax deductible as expense
-            # per §24 odst. 2 pism. ch) ZDP
-            # Taxable base = gross - deductible foreign tax
+            # No treaty: no credit, foreign tax deductible as expense
             d.expense_czk = d.tax_czk
             taxable_base = d.gross_czk - d.expense_czk
             d.cz_tax_czk = (taxable_base * Decimal("0.15")).quantize(
@@ -1012,7 +1053,12 @@ def print_dividend_results(divs, rates, year):
         print("\n--- Zahranicni dividendy ---")
         for i, d in enumerate(foreign_divs, 1):
             cname = COUNTRY_NAMES.get(d.country, d.country)
-            treaty_label = "SZDZ" if d.has_treaty else "BEZ SZDZ"
+            if d.has_treaty:
+                treaty_rate = TREATY_MAX_DIV_RATE.get(d.country, Decimal("0.15"))
+                treaty_pct = int(treaty_rate * 100)
+                treaty_label = "SZDZ max {}%".format(treaty_pct)
+            else:
+                treaty_label = "BEZ SZDZ"
             print("\n  {}. {} ({}) [{}, {}]".format(
                 i, d.product, d.isin, cname, treaty_label))
             print("     Datum:       {}".format(d.value_date.strftime("%d.%m.%Y")))
@@ -1028,6 +1074,13 @@ def print_dividend_results(divs, rates, year):
                 doplatek = d.cz_tax_czk - d.credit_czk
                 print("     Doplatek:                    {:>10} CZK".format(
                     doplatek.quantize(Q)))
+                # Warn if actual withholding exceeds treaty rate
+                if d.tax_czk > d.credit_czk and d.tax_czk > d.cz_tax_czk * Decimal("0"):
+                    excess = d.tax_czk - d.credit_czk
+                    if excess > Decimal("0.05"):
+                        print("     !! Preplatek srazky {:>6} CZK"
+                              " (lze zadost o vraceni ze zdroj. statu)".format(
+                                  excess.quantize(Q)))
             else:
                 print("     Odpocet dane jako vydaj:     {:>10} CZK".format(
                     d.expense_czk))
