@@ -1168,10 +1168,18 @@ def print_dividend_results(divs, rates, year):
                 abs(d.tax_withheld).quantize(Q), d.ccy,
                 (d.gross + d.tax_withheld).quantize(Q), d.ccy))
 
-    # -- Grand summary --
+    # -- Grand summary with tax return guidance --
     print("\n{}".format("=" * 72))
-    print("  SOUHRN DIVIDEND - ROK {}".format(year))
+    print("  DIVIDENDY - SOUHRN PRO DANOVE PRIZNAN - ROK {}".format(year))
     print("{}".format("=" * 72))
+
+    if cz_divs:
+        cz_total = sum(d.gross for d in cz_divs)
+        cz_tax_total = sum(abs(d.tax_withheld) for d in cz_divs)
+        print("  Ceske dividendy: {} CZK hruba, {} CZK srazka".format(
+            cz_total.quantize(Q), cz_tax_total.quantize(Q)))
+        print("  -> NEUVADET do priznani (srazkova dan dle p36 je konecna)")
+        print()
 
     if foreign_divs:
         total_gross = sum(d.gross_czk for d in foreign_divs)
@@ -1179,29 +1187,23 @@ def print_dividend_results(divs, rates, year):
         total_credit = sum(d.credit_czk for d in foreign_divs)
         total_cz_tax = sum(d.cz_tax_czk for d in foreign_divs)
         total_doplatek = total_cz_tax - total_credit
-        print("  Zahranicni dividendy (p8):")
-        print("    Hrube prijmy:               {:>12} CZK".format(
-            total_gross.quantize(Q)))
+
+        dilci_p8 = total_gross - total_expense
+        print("  >>> HLAVNI FORMULAR <<<")
+        print("  Radek 38 (dilci zaklad dane p8): {:>10} CZK".format(
+            dilci_p8.quantize(Q)))
         if total_expense > 0:
-            print("    Vydaje (dan bez SZDZ):      {:>12} CZK".format(
-                total_expense.quantize(Q)))
-        print("    Dan zaplacena v zahranici:   {:>12} CZK".format(
+            print("    (hrube prijmy {} - vydaje {} z zemi bez SZDZ)".format(
+                total_gross.quantize(Q), total_expense.quantize(Q)))
+        print()
+        print("  >>> PRILOHA c. 3 - zapocet dane ze zahranici <<<")
+        print("  (Vyplnit pro kazdy stat se SZDZ dle tabulky vyse)")
+        print("  Celkem dan zaplacena v zahranici: {:>8} CZK".format(
             sum(d.tax_czk for d in foreign_divs).quantize(Q)))
-        print("    CZ dan 15%:                 {:>12} CZK".format(
-            total_cz_tax.quantize(Q)))
-        if total_credit > 0:
-            print("    Zapocet (zeme se SZDZ):     {:>12} CZK".format(
-                total_credit.quantize(Q)))
-        print("    Doplatek dane v CR:         {:>12} CZK".format(
+        print("  Celkem uznany zapocet:            {:>8} CZK".format(
+            total_credit.quantize(Q)))
+        print("  Doplatek dane v CR:               {:>8} CZK".format(
             total_doplatek.quantize(Q)))
-    if cz_divs:
-        cz_total = sum(d.gross for d in cz_divs)
-        cz_tax_total = sum(abs(d.tax_withheld) for d in cz_divs)
-        print("  Ceske dividendy (srazkova dan):")
-        print("    Hrube prijmy:               {:>12} CZK".format(
-            cz_total.quantize(Q)))
-        print("    Srazena dan:                {:>12} CZK".format(
-            cz_tax_total.quantize(Q)))
     print()
 
 
@@ -1302,24 +1304,24 @@ def print_results(disps, rates, year):
             total_taxable_gain += d.gain_czk
 
     print("\n{}".format("=" * 72))
-    print("  SOUHRN - ROK {}".format(year))
+    print("  KAPITALOVE ZISKY - SOUHRN PRO DANOVE PRIZNAN - ROK {}".format(year))
     print("{}".format("=" * 72))
     n_total = len(disps)
     n_exempt = sum(1 for d in disps if d.exempt)
     n_taxable = n_total - n_exempt
-    print("  Celkem prodeju:           {}".format(n_total))
-    print("    z toho zdanitelnych:    {}".format(n_taxable))
-    print("    z toho osvobozenych:    {}".format(n_exempt))
+    print("  Celkem prodeju:       {}  (zdanitelnych: {}, osvobozenych: {})".format(
+        n_total, n_taxable, n_exempt))
+    print("  Osvobozeno (p4/1/w):  {:>14} CZK  (neuvadi se)".format(
+        total_exempt_gain.quantize(Q2)))
     print()
-    print("  Zdanitelne prijmy (p10):  {:>14} CZK".format(total_income.quantize(Q2)))
-    print("  Vydaje:                   {:>14} CZK".format(total_expense.quantize(Q2)))
-    print("  Dilci zaklad dane:        {:>14} CZK".format(total_taxable_gain.quantize(Q2)))
-    print("  Osvobozeno (casovy test): {:>14} CZK".format(total_exempt_gain.quantize(Q2)))
-    if total_taxable_gain > 0:
-        tax = (total_taxable_gain * Decimal("0.15")).quantize(
-            Decimal("1"), rounding=ROUND_HALF_UP
-        )
-        print("  Dan 15 %:                {:>14} CZK".format(tax))
+    print("  >>> PRILOHA c. 2, oddil 2, tabulka c. 1 (p10 ZDP) <<<")
+    print("  Druh prijmu: Prijmy z uplatneho prevodu cennych papiru p10/1/b/1")
+    print("  Prijmy:               {:>14} CZK".format(total_income.quantize(Q2)))
+    print("  Vydaje:               {:>14} CZK".format(total_expense.quantize(Q2)))
+    print()
+    dilci = total_taxable_gain.quantize(Q2)
+    print("  >>> HLAVNI FORMULAR <<<")
+    print("  Radek 40 (dilci zaklad dane p10): {:>10} CZK".format(dilci))
     print()
 
 
